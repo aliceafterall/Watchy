@@ -1,4 +1,5 @@
 #include "Watchy.h"
+#include <time.h>
 
 DS3232RTC Watchy::RTC(false); 
 GxEPD2_BW<GxEPD2_154_D67, GxEPD2_154_D67::HEIGHT> Watchy::display(GxEPD2_154_D67(CS, DC, RESET, BUSY));
@@ -10,6 +11,11 @@ RTC_DATA_ATTR bool WIFI_CONFIGURED;
 RTC_DATA_ATTR bool BLE_CONFIGURED;
 RTC_DATA_ATTR weatherData currentWeather;
 RTC_DATA_ATTR int weatherIntervalCounter = WEATHER_UPDATE_INTERVAL;
+
+const int32_t SLOW_CLOCK_MULTIPLIER = 8500000 / 256;
+
+struct tm timeinfo;
+bool time_is_set = false;
 
 String getValue(String data, char separator, int index)
 {
@@ -28,9 +34,15 @@ String getValue(String data, char separator, int index)
   return found>index ? data.substring(strIndex[0], strIndex[1]) : "";
 }
 
-Watchy::Watchy(){} //constructor
+#define ESP_RTC  // enable using the ESP32-PICO-D4's internal clocks for time-keeping
+
+Watchy::Watchy(){  //constructor
+    // use 8.5 MHz oscillator divided into 256 (~33 kHz) for CLK_SLOW instead of the default 150 kHz oscillator
+    rtc_clk_slow_freq_set(RTC_SLOW_FREQ_8MD256);
+} 
 
 void Watchy::init(String datetime){
+    Serial.begin(115200);
     esp_sleep_wakeup_cause_t wakeup_reason;
     wakeup_reason = esp_sleep_get_wakeup_cause(); //get wake up reason
     Wire.begin(SDA, SCL); //init i2c
@@ -40,18 +52,8 @@ void Watchy::init(String datetime){
         #ifdef ESP_RTC
         case ESP_SLEEP_WAKEUP_TIMER: //ESP Internal RTC
             if(guiState == WATCHFACE_STATE){
-                RTC.read(currentTime);
-                currentTime.Minute++;
-                tmElements_t tm;
-                tm.Month = currentTime.Month;
-                tm.Day = currentTime.Day;
-                tm.Year = currentTime.Year;
-                tm.Hour = currentTime.Hour;
-                tm.Minute = currentTime.Minute;
-                tm.Second = 0;
-                time_t t = makeTime(tm);
-                RTC.set(t);
-                RTC.read(currentTime);           
+                Serial.println("woke for internal RTC");
+                readCurrentTime();
                 showWatchFace(true); //partial updates on tick
             }
             break;        
@@ -69,8 +71,13 @@ void Watchy::init(String datetime){
         default: //reset
             #ifndef ESP_RTC
             _rtcConfig(datetime);
+            #else
+            syncNTP();
+            readCurrentTime();
+
             #endif
             _bmaConfig();
+
             showWatchFace(false); //full update on reset
             break;
     }
@@ -82,10 +89,43 @@ void Watchy::deepSleep(){
   esp_sleep_enable_ext0_wakeup(RTC_PIN, 0); //enable deep sleep wake on RTC interrupt
   #endif  
   #ifdef ESP_RTC
-  esp_sleep_enable_timer_wakeup(60000000);
+  esp_sleep_enable_timer_wakeup(SLOW_CLOCK_MULTIPLIER * 60 * 10000); 
   #endif 
   esp_sleep_enable_ext1_wakeup(BTN_PIN_MASK, ESP_EXT1_WAKEUP_ANY_HIGH); //enable deep sleep wake on button press
   esp_deep_sleep_start();
+}
+
+void Watchy::syncNTP() {
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    while (WiFi.status() != WL_CONNECTED ) { delay(500); Serial.print(F(".")); }
+    Serial.println("Connected to wifi and syncing time");
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    // See https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv for Timezone codes for your region
+    setenv("TZ", "EST5EDT,M3.2.0,M11.1.0", 1);
+
+    Serial.println("Waiting for sync...");
+    while(!sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+        Serial.print(".");
+        delay(100);
+    }
+}
+
+void Watchy::readCurrentTime() {
+    time_t now;
+    time(&now);
+
+    setenv("TZ", "EST5EDT,M3.2.0,M11.1.0", 1);
+
+    tm local;
+    localtime_r(&now, &local);
+
+    currentTime.Month = local.tm_mon + 1;
+    currentTime.Day = local.tm_mday;
+    currentTime.Wday = local.tm_wday + 1;
+    currentTime.Hour = local.tm_hour;
+    currentTime.Minute = local.tm_min;
+    currentTime.Second = local.tm_sec;
+    currentTime.Year = local.tm_year - 70;
 }
 
 void Watchy::_rtcConfig(String datetime){
@@ -148,9 +188,13 @@ void Watchy::handleButtonPress(){
   //Back Button
   else if (wakeupBit & BACK_BTN_MASK){
     if(guiState == MAIN_MENU_STATE){//exit to watch face if already in menu
-      RTC.alarm(ALARM_2); //resets the alarm flag in the RTC
-      RTC.read(currentTime);
-      showWatchFace(false);
+        #ifdef ESP_RTC
+            readCurrentTime();
+        #else
+            RTC.alarm(ALARM_2); //resets the alarm flag in the RTC
+            RTC.read(currentTime);
+        #endif
+        showWatchFace(false);
     }else if(guiState == APP_STATE){
       showMenu(menuIndex, false);//exit to menu if already in app
     }else if(guiState == FW_UPDATE_STATE){
@@ -221,14 +265,18 @@ void Watchy::handleButtonPress(){
           }else if(digitalRead(BACK_BTN_PIN) == 1){
             lastTimeout = millis();
             if(guiState == MAIN_MENU_STATE){//exit to watch face if already in menu
-            RTC.alarm(ALARM_2); //resets the alarm flag in the RTC
-            RTC.read(currentTime);
-            showWatchFace(false);
-            break; //leave loop
+                #ifdef ESP_RTC
+                    readCurrentTime();
+                #else
+                    RTC.alarm(ALARM_2); //resets the alarm flag in the RTC
+                    RTC.read(currentTime);
+                #endif
+                showWatchFace(false);
+                break; //leave loop
             }else if(guiState == APP_STATE){
-            showMenu(menuIndex, false);//exit to menu if already in app
+                showMenu(menuIndex, false);//exit to menu if already in app
             }else if(guiState == FW_UPDATE_STATE){
-            showMenu(menuIndex, false);//exit to menu if already in app
+                showMenu(menuIndex, false);//exit to menu if already in app
             }            
           }else if(digitalRead(UP_BTN_PIN) == 1){
             lastTimeout = millis();
@@ -360,7 +408,16 @@ void Watchy::setTime(){
 
     guiState = APP_STATE;
 
+    #ifdef ESP_RTC
+    syncNTP();
+    readCurrentTime();
+    showMenu(menuIndex, false);
+    return;
+    #endif
+
+    #ifndef ESP_RTC
     RTC.read(currentTime);
+    #endif
 
     int8_t minute = currentTime.Minute;
     int8_t hour = currentTime.Hour;
@@ -512,7 +569,15 @@ void Watchy::setTime(){
     tm.Second = 0;
 
     time_t t = makeTime(tm) + FUDGE;
+
+    #ifdef ESP_RTC
+    // const struct timeval tv;
+    // tv.tv_sec = t;
+    // settimeofday(tv, NULL);
+    #endif
+    #ifndef ESP_RTC
     RTC.set(t);
+    #endif
 
     showMenu(menuIndex, false);
 
@@ -819,7 +884,7 @@ void Watchy::_configModeCallback (WiFiManager *myWiFiManager) {
 }
 
 bool Watchy::connectWiFi(){
-    if(WL_CONNECT_FAILED == WiFi.begin()){//WiFi not setup, you can also use hard coded credentials with WiFi.begin(SSID,PASS);
+    if(WL_CONNECT_FAILED == WiFi.begin(WIFI_SSID, WIFI_PASSWORD)){//WiFi not setup, you can also use hard coded credentials with WiFi.begin(SSID,PASS);
         WIFI_CONFIGURED = false;
     }else{
         if(WL_CONNECTED == WiFi.waitForConnectResult()){//attempt to connect for 10s
@@ -942,25 +1007,3 @@ void Watchy::updateFWBegin(){
     btStop();
     showMenu(menuIndex, false);
 }
-
-// time_t compileTime()
-// {   
-//     const time_t FUDGE(10);    //fudge factor to allow for upload time, etc. (seconds, YMMV)
-//     const char *compDate = __DATE__, *compTime = __TIME__, *months = "JanFebMarAprMayJunJulAugSepOctNovDec";
-//     char compMon[3], *m;
-
-//     strncpy(compMon, compDate, 3);
-//     compMon[3] = '\0';
-//     m = strstr(months, compMon);
-
-//     tmElements_t tm;
-//     tm.Month = ((m - months) / 3 + 1);
-//     tm.Day = atoi(compDate + 4);
-//     tm.Year = atoi(compDate + 7) - YEAR_OFFSET; // offset from 1970, since year is stored in uint8_t
-//     tm.Hour = atoi(compTime);
-//     tm.Minute = atoi(compTime + 3);
-//     tm.Second = atoi(compTime + 6);
-
-//     time_t t = makeTime(tm);
-//     return t + FUDGE;        //add fudge factor to allow for compile time
-// }
